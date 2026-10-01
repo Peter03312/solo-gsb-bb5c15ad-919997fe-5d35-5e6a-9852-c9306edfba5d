@@ -10,6 +10,13 @@
   并发变更不可能超用容量；
 * 新增封闭若与任一已出发（fixed）组剩余路线相交，直接返回 409，
   数据原样保留、不触发任何重排。
+
+修订追溯
+========
+每次成功的编排变更在同一事务内追加一条修订记录：全局递增修订号、
+触发操作、提交时分钟、提交前后的完整编排快照。被拒绝的请求（409/422）
+不产生修订。修订持久化于 SQLite，场景重置与服务重启后均可查；
+历史快照原样返回，不按当前场景重算。
 """
 from __future__ import annotations
 
@@ -24,8 +31,10 @@ from pydantic import BaseModel, Field
 
 from . import db
 from .planner import plan_group
-from .schemas import (ClosureIn, ConflictOut, GroupIn, GroupPlanOut,
-                      PlanResponse, ScenarioIn, StepOut)
+from .schemas import (ClosureIn, ConflictOut, FieldChange, GroupChangeOut,
+                      GroupIn, GroupPlanOut, PlanResponse,
+                      RevisionDetailResponse, RevisionListResponse,
+                      ScenarioIn, StepOut)
 from .seed import SEED_SCENARIO
 
 DB_PATH = os.getenv("EVAC_DB_PATH", "/data/evacuation.db")
@@ -57,9 +66,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.0.0",
+    version="1.1.0",
     description="按优先级逐组编排截止前最早到达的疏散路线，"
-                "支持封闭时段、每分钟容量约束与增量重排。",
+                "支持封闭时段、每分钟容量约束与增量重排；"
+                "每次成功变更生成全局递增修订号，可追溯前后编排差异。",
     lifespan=lifespan,
 )
 
@@ -90,6 +100,7 @@ async def _load_scenario(conn: aiosqlite.Connection, scenario: ScenarioIn) -> No
         if g.origin not in nodes:
             raise HTTPException(422, f"组 {g.id} 的起点 {g.origin} 不在场馆节点中")
 
+    before = await _build_plan_response(conn)
     async with db.transaction(conn):
         await db.reset_db(conn)
         for p in scenario.passages:
@@ -111,6 +122,8 @@ async def _load_scenario(conn: aiosqlite.Connection, scenario: ScenarioIn) -> No
                 (g.id, g.size, g.origin, g.earliest_departure,
                  g.priority, g.deadline))
         await _replan_pending(conn, in_transaction=True)
+        after = await _build_plan_response(conn)
+        await _commit_revision(conn, "scenario", before, after)
 
 
 async def _replan_pending(conn: aiosqlite.Connection,
@@ -201,6 +214,61 @@ async def _build_plan_response(conn: aiosqlite.Connection) -> PlanResponse:
     return PlanResponse(current_minute=minute_now, groups=out)
 
 
+async def _commit_revision(conn: aiosqlite.Connection, operation: str,
+                           before: PlanResponse, after: PlanResponse) -> int:
+    """在调用方的事务内写入修订记录，返回全局递增修订号。
+
+    编排变更与修订记录同事务提交；快照为当时落库的完整编排
+    （含 fixed 组状态与逐段通行时刻），日后查询原样返回、不重算。
+    """
+    return await db.insert_revision(
+        conn, operation, after.current_minute,
+        before.model_dump_json(), after.model_dump_json())
+
+
+# 逐组差异比较字段：状态、出口、出发/到达分钟、路线、逐段通行时刻、失败原因
+_DIFF_FIELDS = ("status", "exit_id", "departure_minute", "arrival_minute",
+                "route", "steps", "reason", "detail")
+
+
+def _jsonable(value):
+    if isinstance(value, BaseModel):
+        return value.model_dump()
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    return value
+
+
+def _diff_plans(before: PlanResponse, after: PlanResponse
+                ) -> list[GroupChangeOut]:
+    """逐组对比前后编排快照：新增 / 移除 / 关键字段前后值。"""
+    before_map = {g.group_id: g for g in before.groups}
+    after_map = {g.group_id: g for g in after.groups}
+    changes: list[GroupChangeOut] = []
+    for gid in sorted(set(before_map) | set(after_map)):
+        b = before_map.get(gid)
+        a = after_map.get(gid)
+        if b is None:
+            changes.append(GroupChangeOut(
+                group_id=gid, change="added", after=a))
+            continue
+        if a is None:
+            changes.append(GroupChangeOut(
+                group_id=gid, change="removed", before=b))
+            continue
+        fields: dict[str, FieldChange] = {}
+        for name in _DIFF_FIELDS:
+            bv, av = getattr(b, name), getattr(a, name)
+            if bv != av:
+                fields[name] = FieldChange(
+                    before=_jsonable(bv), after=_jsonable(av))
+        if fields:
+            changes.append(GroupChangeOut(
+                group_id=gid, change="changed", before=b, after=a,
+                fields=fields))
+    return changes
+
+
 # --------------------------------------------------------------------------
 # HTTP API
 # --------------------------------------------------------------------------
@@ -240,6 +308,7 @@ async def add_groups(groups: list[GroupIn], request: Request):
             if g.origin not in known_nodes:
                 raise HTTPException(422,
                     f"组 {g.id} 的起点 {g.origin} 不是场馆节点")
+        before = await _build_plan_response(conn)
         async with db.transaction(conn):
             for g in groups:
                 await conn.execute(
@@ -250,6 +319,8 @@ async def add_groups(groups: list[GroupIn], request: Request):
                     (g.id, g.size, g.origin, g.earliest_departure,
                      g.priority, g.deadline))
             await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await _commit_revision(conn, "groups", before, after)
         return await _build_plan_response(conn)
 
 
@@ -277,11 +348,14 @@ async def add_closure(closure: ClosureIn, request: Request):
                     "conflicts": [cf.model_dump() for cf in conflicts],
                 })
 
+        before = await _build_plan_response(conn)
         async with db.transaction(conn):
             await conn.execute(
                 "INSERT INTO closures(edge_id, start_minute, end_minute) VALUES(?,?,?)",
                 (closure.edge_id, closure.start_minute, closure.end_minute))
             await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await _commit_revision(conn, "closures", before, after)
         return await _build_plan_response(conn)
 
 
@@ -302,6 +376,7 @@ async def advance_minute(request: Request, payload: TickIn | None = None):
 
     async with request.app.state.lock:
         minute_now = await db.get_current_minute(conn) + delta
+        before = await _build_plan_response(conn)
         async with db.transaction(conn):
             await db.set_current_minute(conn, minute_now)
             # 1) 旧计划中已经出发的组立即固定，不参与本次重排
@@ -311,6 +386,8 @@ async def advance_minute(request: Request, payload: TickIn | None = None):
                 (minute_now,))
             # 2) 其余未出发组以当前分钟为最早出发重新安排
             await _replan_pending(conn, in_transaction=True)
+            after = await _build_plan_response(conn)
+            await _commit_revision(conn, "tick", before, after)
         return await _build_plan_response(conn)
 
 
@@ -352,3 +429,41 @@ async def get_edge_load(edge_id: int, request: Request,
                 "traversal_minutes": cap_row[1],
                 "minutes": sorted(per_minute.values(),
                                   key=lambda x: x["minute"])}
+
+
+@app.get("/revisions", tags=["修订"], response_model=RevisionListResponse)
+async def list_revisions(request: Request):
+    """列出全部编排修订（按修订号升序）。
+
+    每次成功的场景重置 / 新增组 / 登记封闭 / 推进时间产生一条修订；
+    被拒绝的请求不产生修订。修订跨场景重置与服务重启保留。
+    """
+    async with request.app.state.lock:
+        rows = await db.list_revisions(request.app.state.db)
+    return RevisionListResponse(revisions=rows)
+
+
+@app.get("/revisions/{revision_id}", tags=["修订"],
+         response_model=RevisionDetailResponse)
+async def get_revision(revision_id: int, request: Request):
+    """按修订号查询：触发操作、提交时分钟、前后完整编排快照及逐组差异。
+
+    快照为当时落库的编排（含 fixed 组状态与逐段通行时刻），原样返回、
+    不按当前场景重算；未知修订号返回 404。
+    """
+    async with request.app.state.lock:
+        rev = await db.get_revision(request.app.state.db, revision_id)
+    if rev is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "REVISION_NOT_FOUND",
+                "message": f"修订号 {revision_id} 不存在，"
+                           f"可先调用 GET /revisions 查看已有修订",
+            })
+    before = PlanResponse.model_validate_json(rev["before_json"])
+    after = PlanResponse.model_validate_json(rev["after_json"])
+    return RevisionDetailResponse(
+        revision=rev["revision"], operation=rev["operation"],
+        minute=rev["minute"], before=before, after=after,
+        changes=_diff_plans(before, after))

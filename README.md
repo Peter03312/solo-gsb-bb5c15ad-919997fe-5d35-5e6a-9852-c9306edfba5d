@@ -57,6 +57,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/closures` | 新增左闭右开封闭时段；触及已出发组剩余路线则 **409 整次拒绝** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用，可加 `?minute=n` |
+| GET | `/revisions` | 列出全部编排修订（修订号、触发操作、提交时分钟） |
+| GET | `/revisions/{revision_id}` | 某次修订的前后编排快照与逐组差异；未知修订号 **404** |
 
 ### 请求体
 
@@ -153,6 +155,10 @@ curl -s http://localhost:8000/plan | python3 -m json.tool
 
 curl -s -X POST http://localhost:8000/tick \
   -H 'Content-Type: application/json' -d '{"minutes": 5}'
+
+# 追溯变更：列出全部修订，查看第 1 次修订的前后来龙去脉
+curl -s http://localhost:8000/revisions | python3 -m json.tool
+curl -s http://localhost:8000/revisions/1 | python3 -m json.tool
 ```
 
 ## 5. 编排语义（约定）
@@ -178,18 +184,85 @@ curl -s -X POST http://localhost:8000/tick \
    拒绝（409），不写入封闭、不触发重排、不改动任何编排。
 9. **并发**：全部变更接口由同一把异步互斥锁串行化，容量逐组累加校验，
    并发变更不会超用容量。
+10. **修订审计**：每次成功变更与一条修订记录（触发操作、提交时分钟、
+    前后完整编排快照）在同一事务内提交；被拒绝的请求不产生修订；
+    修订跨场景重置与服务重启保留，历史快照原样返回、不按当前场景重算。
 
-## 6. 项目结构
+## 6. 修订追溯（变更审计）
+
+每次**成功**的编排变更——场景重置（`POST /scenario`）、新增人群组
+（`POST /groups`）、登记封闭（`POST /closures`）、推进时间（`POST /tick`）
+——都会生成一个**全局递增修订号**，并与编排变更在**同一个 SQLite 事务**
+内提交（启动时自动写入的演示数据也会产生一条 `scenario` 修订）：
+
+* 记录内容：触发操作（`scenario` / `groups` / `closures` / `tick`）、
+  提交时的当前分钟、提交**前**与提交**后**的完整编排快照（与 `GET /plan`
+  同构，含各组状态与逐段通行时刻）。
+* 被拒绝的请求（封闭冲突 409、重复组 409、参数校验 422 等）不产生任何
+  修订。
+* 修订持久化在 SQLite 中：场景重置不会清除历史修订，服务重启后依然可查。
+* 历史快照是变更提交时落库的结果（含当时 `fixed` 组状态与逐段
+  enter/exit 分钟），查询历史时**原样返回、不按当前场景重算**。
+* 并发变更由互斥锁串行化，修订号按实际提交顺序递增；编排变更与修订记录
+  同事务提交，查询永远不会看到只写入其中一方的中间状态。
+
+### 查询接口
+
+`GET /revisions` —— 修订列表（按修订号升序）：
+
+```json
+{
+  "revisions": [
+    {"revision": 1, "operation": "scenario", "minute": 0},
+    {"revision": 2, "operation": "tick", "minute": 5}
+  ]
+}
+```
+
+`GET /revisions/{revision_id}` —— 修订详情：前后快照 + 逐组差异：
+
+```json
+{
+  "revision": 2,
+  "operation": "tick",
+  "minute": 5,
+  "before": {"current_minute": 0, "groups": []},
+  "after":  {"current_minute": 5, "groups": []},
+  "changes": [
+    {"group_id": 3, "change": "changed",
+     "before": {}, "after": {},
+     "fields": {"status": {"before": "scheduled", "after": "fixed"}}},
+    {"group_id": 9, "change": "added",   "before": null, "after": {}},
+    {"group_id": 7, "change": "removed", "before": {}, "after": null}
+  ]
+}
+```
+
+* `change`：`added`（本组新增）、`removed`（本组移除）、`changed`
+  （字段变化，`fields` 给出逐字段前后值；比较字段为 `status`、`exit_id`、
+  `departure_minute`、`arrival_minute`、`route`、`steps`、`reason`、
+  `detail`）。
+* 未变化的组不出现在 `changes` 中，其当时状态见 `before` / `after` 快照。
+* 未知修订号返回 HTTP 404：
+
+```json
+{
+  "error": "REVISION_NOT_FOUND",
+  "message": "修订号 999 不存在，可先调用 GET /revisions 查看已有修订"
+}
+```
+
+## 7. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑
+  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑、修订记录与查询
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、修订读写
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
-examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发集成测试（pytest）
+examples/       curl 与 Python 调用示例（含修订追溯）
+tests/          算法单元测试与 API/并发/修订追溯集成测试（pytest）
 ```
 
 本地运行测试：

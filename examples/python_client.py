@@ -92,3 +92,21 @@ if __name__ == "__main__":
     status, plan = call("GET", "/plan")
     show("拒绝后查询，原编排保持不变", status, plan)
     summarize(plan)
+
+    # ---- 修订追溯：每次成功变更生成全局递增修订号，被拒绝的请求不产生 ----
+    status, revs = call("GET", "/revisions")
+    show("修订列表（修订号 / 触发操作 / 提交时分钟）", status, revs)
+
+    last_rev = revs["revisions"][-1]["revision"]
+    status, detail = call("GET", f"/revisions/{last_rev}")
+    show(f"修订 {last_rev} 详情：前后完整编排快照与逐组差异", status, detail)
+    for ch in detail["changes"]:
+        if ch["change"] == "changed":
+            fields = {k: f"{v['before']} -> {v['after']}"
+                      for k, v in ch["fields"].items()}
+            print(f"  组 {ch['group_id']} 字段变化: {fields}")
+        else:
+            print(f"  组 {ch['group_id']} {ch['change']}")
+
+    status, missing = call("GET", "/revisions/999999")
+    show("未知修订号（预期 404 明确报错）", status, missing)

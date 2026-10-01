@@ -1,7 +1,7 @@
 """HTTP 请求/响应模型（字段 snake_case，原因码附中文说明）。"""
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -85,3 +85,51 @@ class ConflictOut(BaseModel):
     enter_minute: int
     exit_minute: int
     closure: list[int] = Field(description="与之相交的封闭时段 [start,end)")
+
+
+# --------------------------------------------------------------------------
+# 编排修订（变更审计）
+# --------------------------------------------------------------------------
+
+class RevisionSummary(BaseModel):
+    revision: int = Field(..., description="全局递增修订号")
+    operation: str = Field(
+        ..., description="触发操作：scenario | groups | closures | tick")
+    minute: int = Field(..., description="提交时的当前分钟")
+
+
+class RevisionListResponse(BaseModel):
+    revisions: list[RevisionSummary]
+
+
+class FieldChange(BaseModel):
+    before: Any = None
+    after: Any = None
+
+
+class GroupChangeOut(BaseModel):
+    group_id: int
+    change: str = Field(
+        ..., description="added（新增）| removed（移除）| changed（字段变化）")
+    before: Optional[GroupPlanOut] = Field(
+        None, description="提交前该组编排（added 时为 null）")
+    after: Optional[GroupPlanOut] = Field(
+        None, description="提交后该组编排（removed 时为 null）")
+    fields: dict[str, FieldChange] = Field(
+        default_factory=dict,
+        description="逐字段前后值（仅 changed 时非空）；比较字段：status、"
+                    "exit_id、departure_minute、arrival_minute、route、"
+                    "steps、reason、detail")
+
+
+class RevisionDetailResponse(BaseModel):
+    revision: int = Field(..., description="全局递增修订号")
+    operation: str = Field(..., description="触发操作")
+    minute: int = Field(..., description="提交时的当前分钟")
+    before: PlanResponse = Field(..., description="提交前的完整编排快照")
+    after: PlanResponse = Field(
+        ..., description="提交后的完整编排快照（即当时的编排）")
+    changes: list[GroupChangeOut] = Field(
+        default_factory=list,
+        description="逐组前后差异：新增、移除或状态/出发与到达分钟/路线/"
+                    "失败原因等字段变化；未变化的组不在其中")

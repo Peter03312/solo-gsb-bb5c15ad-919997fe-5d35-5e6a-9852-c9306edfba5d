@@ -65,4 +65,16 @@ curl -s "$BASE/plan" | python3 -m json.tool
 say "9) 查询通道 1 每分钟容量占用（核验不超容量）"
 curl -s "$BASE/passages/1/load" | python3 -m json.tool
 
+say "10) 列出全部编排修订（每次成功变更一条；第 7 步的 409 拒绝不产生修订）"
+curl -s "$BASE/revisions" | python3 -m json.tool
+
+say "11) 查询最近一次修订：触发操作、提交时分钟、前后完整编排快照与逐组差异"
+LAST_REV=$(curl -s "$BASE/revisions" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["revision"])')
+curl -s "$BASE/revisions/$LAST_REV" | python3 -m json.tool
+
+say "12) 查询未知修订号（预期 HTTP 404 明确报错）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999999"
+python3 -m json.tool /tmp/resp.json || true
+
 say "完成。交互文档： $BASE/docs"

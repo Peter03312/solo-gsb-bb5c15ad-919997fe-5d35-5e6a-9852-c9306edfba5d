@@ -54,6 +54,16 @@ CREATE TABLE IF NOT EXISTS route_steps (
     exit_minute  INTEGER NOT NULL,
     PRIMARY KEY (group_id, seq)
 );
+
+-- 编排修订（变更审计）：每次成功变更与编排写入在同一事务提交。
+-- 场景重置（reset_db）刻意不清除此表，服务重启后亦保留。
+CREATE TABLE IF NOT EXISTS revisions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,  -- 全局递增修订号
+    operation   TEXT NOT NULL,      -- scenario | groups | closures | tick
+    minute      INTEGER NOT NULL,   -- 提交时的当前分钟
+    before_json TEXT NOT NULL,      -- 提交前完整编排（PlanResponse JSON）
+    after_json  TEXT NOT NULL       -- 提交后完整编排（PlanResponse JSON）
+);
 """
 
 
@@ -65,7 +75,10 @@ async def init_db(db: aiosqlite.Connection) -> None:
 
 
 async def reset_db(db: aiosqlite.Connection) -> None:
-    """清空全部业务表并归零当前分钟（调用方负责事务）。"""
+    """清空全部业务表并归零当前分钟（调用方负责事务）。
+
+    刻意不清除 revisions：历史修订在场景重置后仍须可查。
+    """
     for table in ("route_steps", "groups", "closures", "exits", "edges", "meta"):
         await db.execute(f"DELETE FROM {table}")
     await db.execute(
@@ -212,3 +225,44 @@ async def persist_replan(db: aiosqlite.Connection, results: list[dict],
                    departure_minute=NULL, arrival_minute=NULL, exit_id=NULL,
                    fail_reason=?, fail_detail=? WHERE id=?""",
                 (r["reason"], r["detail"], gid))
+
+
+# --------------------------------------------------------------------------
+# 编排修订（变更审计）
+# --------------------------------------------------------------------------
+
+async def insert_revision(db: aiosqlite.Connection, operation: str,
+                          minute: int, before_json: str,
+                          after_json: str) -> int:
+    """写入一条修订记录并返回全局递增修订号（调用方负责开启事务）。
+
+    与编排变更同事务提交：查询永远不会看到只写入其中一方的中间状态。
+    """
+    await db.execute(
+        """INSERT INTO revisions(operation, minute, before_json, after_json)
+           VALUES(?,?,?,?)""",
+        (operation, minute, before_json, after_json))
+    async with db.execute("SELECT last_insert_rowid()") as cur:
+        row = await cur.fetchone()
+    return int(row[0])
+
+
+async def list_revisions(db: aiosqlite.Connection) -> list[dict]:
+    """按修订号升序列出全部修订摘要。"""
+    async with db.execute(
+            "SELECT id, operation, minute FROM revisions ORDER BY id") as cur:
+        rows = await cur.fetchall()
+    return [{"revision": row[0], "operation": row[1], "minute": row[2]}
+            for row in rows]
+
+
+async def get_revision(db: aiosqlite.Connection, revision_id: int):
+    """按修订号取完整记录（含前后编排快照 JSON）；不存在返回 None。"""
+    async with db.execute(
+            """SELECT id, operation, minute, before_json, after_json
+               FROM revisions WHERE id=?""", (revision_id,)) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return None
+    return {"revision": row[0], "operation": row[1], "minute": row[2],
+            "before_json": row[3], "after_json": row[4]}
