@@ -85,3 +85,42 @@ class ConflictOut(BaseModel):
     enter_minute: int
     exit_minute: int
     closure: list[int] = Field(description="与之相交的封闭时段 [start,end)")
+
+
+# --------------------------------------------------------------------------
+# 修订历史（编排变更追溯）
+# --------------------------------------------------------------------------
+
+class GroupChangeOut(BaseModel):
+    """单个组在一次修订前后的差异。"""
+    group_id: int
+    change: str = Field(description="added=新增 | removed=移除 | changed=编排变化")
+    changed_fields: list[str] = Field(
+        default_factory=list,
+        description="change=changed 时发生变化的字段，如 status/route/steps/reason")
+    before: Optional[GroupPlanOut] = Field(
+        None, description="提交前该组编排（added 时为 null）")
+    after: Optional[GroupPlanOut] = Field(
+        None, description="提交后该组编排（removed 时为 null）")
+
+
+class RevisionSummaryOut(BaseModel):
+    rev: int = Field(description="全局递增修订号（按实际提交顺序编号）")
+    operation: str = Field(
+        description="触发操作：scenario=场景重置 | groups=新增人群组 | "
+                    "closures=登记封闭 | tick=时间推进")
+    minute: int = Field(description="该修订提交后的当前分钟")
+    detail: dict = Field(default_factory=dict, description="触发操作的参数摘要")
+
+
+class RevisionListOut(BaseModel):
+    revisions: list[RevisionSummaryOut]
+
+
+class RevisionDetailOut(RevisionSummaryOut):
+    snapshot: PlanResponse = Field(
+        description="该修订提交后的完整编排快照（当时状态，含固定组逐段"
+                    "通行时刻；落库保存，不按当前场景重算）")
+    changes: list[GroupChangeOut] = Field(
+        description="各组提交前后差异（新增/移除/状态、出发与到达分钟、"
+                    "路线、失败原因）")

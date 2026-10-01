@@ -92,3 +92,22 @@ if __name__ == "__main__":
     status, plan = call("GET", "/plan")
     show("拒绝后查询，原编排保持不变", status, plan)
     summarize(plan)
+
+    # ---- 修订历史：追溯每次编排变更 ----
+    status, payload = call("GET", "/revisions")
+    show("修订列表（每次成功变更一条，拒绝不产生）", status, payload)
+
+    latest = payload["revisions"][-1]["rev"]
+    status, detail = call("GET", f"/revisions/{latest}")
+    show(f"最新修订 rev={latest} 的快照与逐组差异", status, detail)
+    for ch in detail["changes"]:
+        if ch["change"] == "changed":
+            print(f"  组 {ch['group_id']} 变化字段 {ch['changed_fields']}: "
+                  f"{ch['before']['status']} -> {ch['after']['status']}")
+        else:
+            g = ch["after"] or ch["before"]
+            print(f"  组 {ch['group_id']} {ch['change']} "
+                  f"(status={g['status']})")
+
+    status, payload = call("GET", "/revisions/999999")
+    show("未知修订号（预期 404）", status, payload)

@@ -4,6 +4,8 @@
 输入场馆的有向通道、封闭时段、出口与人群组，按优先级逐组安排**截止前最早到达**
 的路线与出发时间，并保证通道每分钟容量不被超用、封闭时段不被占用。
 支持推进时间、增量新增人群组/封闭，且只重排未出发组。
+每次成功的编排变更都会落库一条**全局递增修订**（前后完整快照 + 逐组差异），
+供指挥员追溯"每次疏散变更为何改动编排"。
 
 ## 1. 一键启动
 
@@ -57,6 +59,8 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/closures` | 新增左闭右开封闭时段；触及已出发组剩余路线则 **409 整次拒绝** |
 | POST | `/tick` | 推进当前分钟（body 可传 `{"minutes": n}`，默认 1） |
 | GET | `/passages/{edge_id}/load` | 通道逐分钟占用，可加 `?minute=n` |
+| GET | `/revisions` | 列出全部修订（修订号/触发操作/当时分钟），重置与重启后保留 |
+| GET | `/revisions/{rev}` | 按修订号查询当时编排快照与各组前后差异；未知修订号 **404** |
 
 ### 请求体
 
@@ -136,6 +140,57 @@ EVAC_DB_PATH=./evacuation.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 }
 ```
 
+### 修订历史（变更追溯）
+
+场景重置、新增人群组、登记封闭、时间推进**成功**时，各产生一条修订：
+全局递增修订号（按实际提交顺序编号）、触发操作及参数摘要、提交后的
+当前分钟、提交前后完整编排快照。**被拒绝的请求（409/422）不产生修订。**
+修订与编排变更在同一 SQLite 事务提交，查询不会看到只写入一方的状态；
+场景重置与服务重启后历史保留、编号继续递增。快照为落库时的完整编排
+（含当时固定组状态与逐段通行时刻），按原样返回，不按当前场景重算。
+
+**GET /revisions**
+
+```json
+{
+  "revisions": [
+    {"rev": 1, "operation": "scenario", "minute": 0,
+     "detail": {"passages": 7, "exits": [5, 6], "closures": 1, "groups": 4}},
+    {"rev": 2, "operation": "tick", "minute": 1,
+     "detail": {"minutes": 1}}
+  ]
+}
+```
+
+`operation`：`scenario`（场景重置）/ `groups`（新增人群组）/
+`closures`（登记封闭）/ `tick`（时间推进）。
+
+**GET /revisions/{rev}**
+
+```json
+{
+  "rev": 2,
+  "operation": "tick",
+  "minute": 1,
+  "detail": {"minutes": 1},
+  "snapshot": {"current_minute": 1, "groups": ["…提交后的完整编排…"]},
+  "changes": [
+    {"group_id": 3, "change": "changed", "changed_fields": ["status"],
+     "before": {"status": "scheduled", "departure_minute": 0,
+                "arrival_minute": 2, "route": [5], "steps": ["…"]},
+     "after":  {"status": "fixed", "departure_minute": 0,
+                "arrival_minute": 2, "route": [5],
+                "steps": [{"edge_id": 5, "from_node": 2, "to_node": 6,
+                           "enter_minute": 0, "exit_minute": 2}]}}
+  ]
+}
+```
+
+每组差异 `change`：`added`（新增，`before` 为 null）/ `removed`
+（移除，`after` 为 null）/ `changed`（`changed_fields` 列出变化的字段，
+`before`/`after` 给出状态、出发与到达分钟、路线、逐段时刻、失败原因的
+前后完整值）。未知修订号返回 HTTP 404 `{"detail": "修订号 N 不存在"}`。
+
 ## 4. 调用示例
 
 ```bash
@@ -178,18 +233,22 @@ curl -s -X POST http://localhost:8000/tick \
    拒绝（409），不写入封闭、不触发重排、不改动任何编排。
 9. **并发**：全部变更接口由同一把异步互斥锁串行化，容量逐组累加校验，
    并发变更不会超用容量。
+10. **修订**：四类变更（场景重置/新增组/登记封闭/推进时间）成功时，在
+    同一事务内追加修订记录（全局递增修订号、触发操作、当时分钟、前后
+    完整编排快照）；被拒绝的请求不产生修订。修订不随场景重置或服务重启
+    丢失，历史快照按落库内容原样返回，不按当前场景重算。
 
 ## 6. 项目结构
 
 ```
 app/
-  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑
+  main.py       FastAPI 路由、事务/互斥、增量重排与拒绝逻辑、修订记录与差异
   planner.py    编排核心：时变 FIFO 多标签最短路 + 容量/封闭可行性
-  db.py         SQLite 建表、世界状态加载、整组事务化持久化
+  db.py         SQLite 建表、世界状态加载、整组事务化持久化、修订落库
   schemas.py    Pydantic 输入/输出模型
   seed.py       启动演示数据
 examples/       curl 与 Python 调用示例
-tests/          算法单元测试与 API/并发集成测试（pytest）
+tests/          算法单元测试与 API/并发/修订历史集成测试（pytest）
 ```
 
 本地运行测试：

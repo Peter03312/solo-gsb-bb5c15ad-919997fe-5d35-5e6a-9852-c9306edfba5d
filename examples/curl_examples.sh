@@ -65,4 +65,16 @@ curl -s "$BASE/plan" | python3 -m json.tool
 say "9) 查询通道 1 每分钟容量占用（核验不超容量）"
 curl -s "$BASE/passages/1/load" | python3 -m json.tool
 
+say "10) 列出修订历史（每次成功变更一条，被拒绝的请求不产生）"
+curl -s "$BASE/revisions" | python3 -m json.tool
+
+say "11) 按修订号查询：当时编排快照 + 各组前后差异（取最新一条）"
+LATEST=$(curl -s "$BASE/revisions" | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["revisions"][-1]["rev"])')
+curl -s "$BASE/revisions/$LATEST" | python3 -m json.tool
+
+say "12) 查询未知修订号（预期 HTTP 404）"
+curl -s -o /tmp/resp.json -w 'HTTP %{http_code}\n' "$BASE/revisions/999999"
+python3 -m json.tool /tmp/resp.json || true
+
 say "完成。交互文档： $BASE/docs"
